@@ -1,8 +1,11 @@
-import streamlit as st
-import pandas as pd
-import networkx as nx
-import plotly.graph_objects as go
+import io
+import os
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
 # === PAGE CONFIG ===
 st.set_page_config(
@@ -166,37 +169,186 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# === AUTO-GENERATE SAMPLE DATA ===
+# === CONSTANTS AND HELPERS ===
+REQUIRED_SCHEMAS = {
+    "Material Data": ["Batch ID", "Initial Quantity"],
+    "Process Steps": ["Batch ID", "Process Step"],
+    "QC Reports": ["Batch ID", "Scrap Quantity"],
+    "Final Output": ["Batch ID", "Final Quantity"],
+}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [col.strip() for col in df.columns]
+    return df
+
+
+def read_uploaded_table(file) -> pd.DataFrame:
+    if file is None:
+        raise ValueError("No file provided")
+    if file.name.lower().endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file)
+
+
+def validate_schema(df: pd.DataFrame, dataset_name: str) -> list[str]:
+    expected = REQUIRED_SCHEMAS[dataset_name]
+    missing = [col for col in expected if col not in df.columns]
+    return missing
+
+
 @st.cache_data
 def generate_sample_data():
     np.random.seed(42)
-    
+
     batches = [f"B{i:03d}" for i in range(1, 11)]
-    
-    material_df = pd.DataFrame({
-        "Batch ID": batches,
-        "Material Type": ["Aluminium 6082"] * 10,
-        "Initial Quantity": np.random.uniform(90, 110, 10).round(2)
-    })
-    
-    process_df = pd.DataFrame({
-        "Batch ID": batches * 3,
-        "Process Step": ["Cutting"]*10 + ["Milling"]*10 + ["QC"]*10
-    })
-    
-    qc_df = pd.DataFrame({
-        "Batch ID": batches,
-        "Scrap Quantity": np.random.uniform(2, 15, 10).round(2),
-        "Defects": np.random.randint(0, 5, 10),
-        "Total Inspected": [100]*10
-    })
-    
-    output_df = pd.DataFrame({
-        "Batch ID": batches,
-        "Final Quantity": material_df["Initial Quantity"] - qc_df["Scrap Quantity"] - np.random.uniform(1, 4, 10).round(2)
-    })
-    
+
+    material_df = pd.DataFrame(
+        {
+            "Batch ID": batches,
+            "Material Type": ["Aluminium 6082"] * 10,
+            "Initial Quantity": np.random.uniform(90, 110, 10).round(2),
+        }
+    )
+
+    process_df = pd.DataFrame(
+        {
+            "Batch ID": batches * 3,
+            "Process Step": ["Cutting"] * 10 + ["Milling"] * 10 + ["QC"] * 10,
+            "Step Order": list(range(1, 4)) * 10,
+        }
+    )
+
+    qc_df = pd.DataFrame(
+        {
+            "Batch ID": batches,
+            "Scrap Quantity": np.random.uniform(2, 15, 10).round(2),
+            "Defects": np.random.randint(0, 5, 10),
+            "Total Inspected": [100] * 10,
+        }
+    )
+
+    output_df = pd.DataFrame(
+        {
+            "Batch ID": batches,
+            "Final Quantity": material_df["Initial Quantity"]
+            - qc_df["Scrap Quantity"]
+            - np.random.uniform(1, 4, 10).round(2),
+        }
+    )
+
     return material_df, process_df, qc_df, output_df
+
+
+@st.cache_data
+def sample_templates() -> dict[str, str]:
+    material, process, qc, output = generate_sample_data()
+    return {
+        "Material Data": material.to_csv(index=False),
+        "Process Steps": process[["Batch ID", "Process Step", "Step Order"]].to_csv(index=False),
+        "QC Reports": qc.to_csv(index=False),
+        "Final Output": output.to_csv(index=False),
+    }
+
+
+def warn_missing_process_steps(process_df: pd.DataFrame | None) -> pd.DataFrame:
+    if process_df is not None and not process_df.empty:
+        return process_df
+
+    st.warning(
+        "Process steps file is missing or empty. Using default steps: Delivery → Cutting → Milling → QC → Finished Product."
+    )
+    batches = ["Unknown"]
+    default_steps = ["Delivery", "Cutting", "Milling", "QC", "Finished Product"]
+    return pd.DataFrame(
+        {
+            "Batch ID": batches * len(default_steps),
+            "Process Step": default_steps,
+            "Step Order": list(range(len(default_steps))),
+        }
+    )
+
+
+def build_transition_table(process_df: pd.DataFrame) -> pd.DataFrame:
+    order_col = "Step Order" if "Step Order" in process_df.columns else None
+    transitions = []
+
+    for batch_id, group in process_df.groupby("Batch ID"):
+        ordered = group.sort_values(order_col) if order_col else group
+        steps = ordered["Process Step"].tolist()
+        for i in range(len(steps) - 1):
+            transitions.append((steps[i], steps[i + 1], batch_id))
+
+    if not transitions:
+        return pd.DataFrame(columns=["source", "target", "Batch ID"])
+
+    transition_df = pd.DataFrame(transitions, columns=["source", "target", "Batch ID"])
+    return transition_df
+
+
+def sankey_from_process(process_df: pd.DataFrame, merged: pd.DataFrame) -> go.Figure:
+    transition_df = build_transition_table(process_df)
+    if transition_df.empty:
+        st.info("Not enough process steps to render a flow map.")
+        return go.Figure()
+
+    link_stats = (
+        transition_df.groupby(["source", "target"])["Batch ID"]
+        .agg(["nunique", list])
+        .reset_index()
+        .rename(columns={"nunique": "count", "list": "batches"})
+    )
+
+    scrap_lookup = merged.set_index("Batch ID")[["Scrap %", "Material Loss %"]]
+
+    link_stats["scrap_pct"] = link_stats["batches"].apply(
+        lambda ids: scrap_lookup.loc[scrap_lookup.index.intersection(ids)]["Scrap %"].mean()
+    )
+    link_stats["loss_pct"] = link_stats["batches"].apply(
+        lambda ids: scrap_lookup.loc[scrap_lookup.index.intersection(ids)]["Material Loss %"].mean()
+    )
+
+    nodes = sorted(set(link_stats["source"]).union(set(link_stats["target"])))
+    node_indices = {name: idx for idx, name in enumerate(nodes)}
+
+    colors = ["rgba(16, 185, 129, 0.8)", "rgba(6, 182, 212, 0.8)", "rgba(139, 92, 246, 0.8)", "rgba(245, 158, 11, 0.8)"]
+
+    fig = go.Figure(
+        data=[
+            go.Sankey(
+                node=dict(
+                    pad=20,
+                    thickness=20,
+                    line=dict(color="white", width=0.5),
+                    label=nodes,
+                    color=[colors[idx % len(colors)] for idx in range(len(nodes))],
+                ),
+                link=dict(
+                    source=[node_indices[s] for s in link_stats["source"]],
+                    target=[node_indices[t] for t in link_stats["target"]],
+                    value=link_stats["count"],
+                    color=[
+                        f"rgba(239,68,68,{min(0.9, (loss or 0)/100 + 0.1)})"
+                        for loss in link_stats["loss_pct"]
+                    ],
+                    hovertemplate=
+                    "<b>%{source.label} → %{target.label}</b><br>"
+                    "Batches: %{value}<br>"
+                    "Avg scrap: %{customdata[0]:.2f}%<br>"
+                    "Avg loss: %{customdata[1]:.2f}%<extra></extra>",
+                    customdata=link_stats[["scrap_pct", "loss_pct"]].values,
+                ),
+            )
+        ]
+    )
+
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=550,
+    )
+    return fig
 
 # === MAIN APP ===
 # Header
@@ -238,6 +390,18 @@ with col4:
     st.markdown("### ✅ Final Output")
     output_file = st.file_uploader("Upload CSV/Excel", type=['csv', 'xlsx'], key="output", label_visibility="collapsed")
 
+template_map = sample_templates()
+template_cols = st.columns(4)
+for idx, (dataset, template) in enumerate(template_map.items()):
+    with template_cols[idx]:
+        st.download_button(
+            label=f"📥 {dataset} Template",
+            data=template,
+            file_name=f"{dataset.replace(' ', '_').lower()}_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
 # Action buttons
 st.markdown("<br>", unsafe_allow_html=True)
 col_btn1, col_btn2, col_btn3 = st.columns([2, 2, 2])
@@ -253,101 +417,84 @@ with col_btn2:
 
 # === ANALYSIS SECTION ===
 if use_sample or (material_file and process_file and qc_file and output_file):
-    
-    # Load data
-    if use_sample:
-        material_df, process_df, qc_df, output_df = generate_sample_data()
-        st.success("✅ Sample data loaded successfully!")
-    else:
-        # Parse uploaded files (simplified - you'd add proper parsing logic)
-        try:
-            material_df = pd.read_csv(material_file) if material_file.name.endswith('.csv') else pd.read_excel(material_file)
-            process_df = pd.read_csv(process_file) if process_file.name.endswith('.csv') else pd.read_excel(process_file)
-            qc_df = pd.read_csv(qc_file) if qc_file.name.endswith('.csv') else pd.read_excel(qc_file)
-            output_df = pd.read_csv(output_file) if output_file.name.endswith('.csv') else pd.read_excel(output_file)
-            st.success("✅ Your files have been uploaded and analyzed successfully!")
-        except Exception as e:
-            st.error(f"Error reading files: {str(e)}")
+
+    try:
+        if use_sample:
+            material_df, process_df, qc_df, output_df = generate_sample_data()
+            st.success("✅ Sample data loaded successfully!")
+        else:
+            material_df = normalize_columns(read_uploaded_table(material_file))
+            process_df = normalize_columns(read_uploaded_table(process_file))
+            qc_df = normalize_columns(read_uploaded_table(qc_file))
+            output_df = normalize_columns(read_uploaded_table(output_file))
+
+        # Validate schemas
+        errors = []
+        for name, df in zip(
+            ["Material Data", "Process Steps", "QC Reports", "Final Output"],
+            [material_df, process_df, qc_df, output_df],
+        ):
+            missing = validate_schema(df, name)
+            if missing:
+                errors.append(f"{name}: missing columns {', '.join(missing)}")
+        if errors:
+            st.error("We couldn't process your files. Please fix the following issues:")
+            for err in errors:
+                st.markdown(f"- {err}")
             st.stop()
-    
+
+    except Exception as e:
+        st.error(f"Error reading files: {str(e)}")
+        st.stop()
+
+    process_df = warn_missing_process_steps(process_df)
+
     # Merge everything
-    merged = material_df.merge(qc_df, on="Batch ID")
-    merged = merged.merge(output_df, on="Batch ID")
-    merged["Material Loss %"] = (merged["Initial Quantity"] - merged["Final Quantity"]) / merged["Initial Quantity"] * 100
+    merged = material_df.merge(qc_df, on="Batch ID", how="inner")
+    merged = merged.merge(output_df, on="Batch ID", how="inner")
+    merged["Material Loss %"] = (
+        (merged["Initial Quantity"] - merged["Final Quantity"]) / merged["Initial Quantity"] * 100
+    )
     merged["Scrap %"] = merged["Scrap Quantity"] / merged["Initial Quantity"] * 100
-    
+
     # === KEY INSIGHTS ===
     st.markdown("## 💎 Key Performance Insights")
-    
+
+    avg_loss = merged["Material Loss %"].mean()
+    avg_scrap = merged["Scrap %"].mean()
+    worst_batch = merged.loc[merged["Scrap %"].idxmax(), "Batch ID"]
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📉 Average Material Loss", f"{merged['Material Loss %'].mean():.1f}%")
-    c2.metric("♻️ Average Scrap Rate", f"{merged['Scrap %'].mean():.1f}%")
-    c3.metric("⚠️ Highest Scrap Batch", merged.loc[merged['Scrap %'].idxmax(), 'Batch ID'])
-    c4.metric("💰 Potential Savings (10t/year)", "€4,200 – €12,800")
-    
+    c1.metric("📉 Average Material Loss", f"{avg_loss:.1f}%")
+    c2.metric("♻️ Average Scrap Rate", f"{avg_scrap:.1f}%")
+    c3.metric("⚠️ Highest Scrap Batch", worst_batch)
+
+    material_cost = st.number_input("Material cost per unit (€/kg or equivalent)", min_value=0.0, value=1500.0)
+    annual_batches = st.number_input("Annual batches", min_value=1, value=500, step=10)
+    avg_initial = merged["Initial Quantity"].mean()
+    annual_loss_units = avg_initial * (avg_scrap / 100) * annual_batches
+    estimated_savings = annual_loss_units * material_cost
+    c4.metric("💰 Potential Annual Savings", f"€{estimated_savings:,.0f}")
+
     # === MATERIAL FLOW MAP ===
     st.markdown("## 🔄 Material Flow Visualization")
-    
-    G = nx.DiGraph()
-    steps = ['📦 Delivery', '✂️ Cutting', '🔧 Milling', '🔍 QC', '✨ Finished Product']
-    for i in range(len(steps)-1):
-        G.add_edge(steps[i], steps[i+1])
-    pos = {step: (i, 0) for i, step in enumerate(steps)}
-    
-    # Edge traces
-    edge_x, edge_y = [], []
-    for edge in G.edges():
-        x0, y0 = pos[edge[0]]
-        x1, y1 = pos[edge[1]]
-        edge_x.extend([x0, x1, None])
-        edge_y.extend([y0, y1, None])
-    
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=8, color='rgba(16, 185, 129, 0.6)'),
-        mode='lines',
-        hoverinfo='none'
+    sankey_fig = sankey_from_process(process_df, merged)
+    st.plotly_chart(sankey_fig, use_container_width=True)
+
+    # === BENCHMARKING & ROI ===
+    st.markdown("## 🎯 Benchmarks & ROI")
+    reduction_target = st.slider("Target scrap reduction (%)", min_value=0, max_value=50, value=15, step=5)
+    reduced_scrap_rate = max(avg_scrap - reduction_target, 0)
+    annual_savings_if_reduced = avg_initial * (avg_scrap - reduced_scrap_rate) / 100 * annual_batches * material_cost
+
+    bench_text = (
+        "World-class (top 20%)" if avg_scrap < 3 else "Competitive (middle 50%)" if avg_scrap < 7 else "Needs attention (bottom 30%)"
     )
-    
-    # Node traces
-    node_x = [pos[node][0] for node in G.nodes()]
-    node_y = [pos[node][1] for node in G.nodes()]
-    node_text = []
-    node_colors = ['#10b981', '#06b6d4', '#8b5cf6', '#f59e0b', '#10b981']
-    
-    avg_scrap = merged["Scrap %"].mean()
-    for node in steps:
-        if node in ["✂️ Cutting", "🔧 Milling", "🔍 QC"]:
-            node_text.append(f"{node}<br>Avg Scrap: {avg_scrap:.1f}%")
-        else:
-            node_text.append(node)
-    
-    node_trace = go.Scatter(
-        x=node_x, y=node_y,
-        mode='markers+text',
-        text=node_text,
-        textposition="bottom center",
-        marker=dict(size=100, color=node_colors, line=dict(width=5, color='#ffffff')),
-        textfont=dict(size=16, color='#ffffff', family='Inter'),
-        hoverinfo="text"
-    )
-    
-    fig = go.Figure(
-        data=[edge_trace, node_trace],
-        layout=go.Layout(
-            showlegend=False,
-            hovermode='closest',
-            margin=dict(b=100, l=60, r=60, t=60),
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-0.5, 4.5]),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-0.8, 0.8]),
-            height=500,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)'
-        )
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Current scrap benchmark", bench_text)
+    col_b.metric("Annual scrap volume", f"{annual_loss_units:,.1f} units")
+    col_c.metric("Savings if achieved target", f"€{annual_savings_if_reduced:,.0f}")
+
     # === BATCH-LEVEL TRACEABILITY ===
     st.markdown("## 📊 Batch-Level Intelligence")
     
@@ -361,7 +508,7 @@ if use_sample or (material_file and process_file and qc_file and output_file):
     
     styled_df = display_df.style.apply(highlight_max, subset=["Material Loss %", "Scrap %"])
     st.dataframe(styled_df, use_container_width=True, height=400)
-    
+
     # === SUCCESS BANNER ===
     st.markdown("""
     <div class="success-box">
@@ -370,7 +517,31 @@ if use_sample or (material_file and process_file and qc_file and output_file):
     """, unsafe_allow_html=True)
     
     # Download button
-    csv = display_df.to_csv(index=False)
+    kpi_summary = pd.DataFrame(
+        {
+            "Metric": [
+                "Average Material Loss %",
+                "Average Scrap %",
+                "Potential Annual Savings (€)",
+                "Target Scrap Reduction %",
+                "Savings at Target (€)",
+            ],
+            "Value": [
+                round(avg_loss, 2),
+                round(avg_scrap, 2),
+                round(estimated_savings, 2),
+                reduction_target,
+                round(annual_savings_if_reduced, 2),
+            ],
+        }
+    )
+
+    buffer = io.StringIO()
+    buffer.write("KPI Summary\n")
+    kpi_summary.to_csv(buffer, index=False)
+    buffer.write("\nBatch Details\n")
+    display_df.to_csv(buffer, index=False)
+    csv = buffer.getvalue()
     st.download_button(
         label="📥 Download Full Report (CSV)",
         data=csv,
@@ -378,6 +549,33 @@ if use_sample or (material_file and process_file and qc_file and output_file):
         mime="text/csv",
         use_container_width=True
     )
+
+    # === FEEDBACK CAPTURE ===
+    with st.expander("💬 Tell us what’s missing"):
+        with st.form("feedback_form"):
+            usefulness = st.radio("How useful was this analysis?", ["Very useful", "Somewhat useful", "Needs work"], index=1)
+            missing = st.text_area("What would you change or add?", placeholder="List the decisions you can/can’t make with this dashboard…")
+            contact = st.text_input("Your email (optional)")
+            submitted = st.form_submit_button("Submit feedback")
+            if submitted:
+                feedback_row = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "use_sample_data": bool(use_sample),
+                            "usefulness": usefulness,
+                            "comment": missing,
+                            "contact": contact,
+                            "avg_scrap_pct": avg_scrap,
+                            "estimated_savings": estimated_savings,
+                        }
+                    ]
+                )
+
+                feedback_file = "feedback_responses.csv"
+                header = not os.path.exists(feedback_file)
+                feedback_row.to_csv(feedback_file, mode="a", header=header, index=False)
+                st.success("Thanks for your feedback! We’ll use it to shape the product roadmap.")
 
 else:
     st.markdown("""
